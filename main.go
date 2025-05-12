@@ -222,29 +222,30 @@ func handleGetUserInteractions(w http.ResponseWriter, r *http.Request) {
 	var filter logicalplan.Expr
 	if direction == "sent" {
 		// Filter by the user who initiated the interaction
-		filter = logicalplan.Col("userId").Eq(logicalplan.Literal(userID))
-	} else { // direction == "received"
+		filter = logicalplan.Col("user_id").Eq(logicalplan.Literal(userID))
+	} else {
 		// Filter by the user who received the interaction
-		filter = logicalplan.Col("reportedUserId").Eq(logicalplan.Literal(userID))
+		filter = logicalplan.Col("reported_user_id").Eq(logicalplan.Literal(userID))
 	}
 
 	results, err := queryInteractions(r.Context(), filter)
 	if err != nil {
-		sendJSONResponse(w, http.StatusInternalServerError, map[string]string{"error": "Failed to retrieve interactions"})
+		// Check if the error is the specific index out of range error for empty results
+		if strings.Contains(err.Error(), "runtime error: index out of range") {
+			log.Printf("[INFO] No interactions found for filter: %v. Returning empty array.", filter)
+			sendJSONResponse(w, http.StatusOK, make([]InteractionRecord, 0)) // Send [] for no results
+		} else {
+			// Handle other actual errors
+			sendJSONResponse(w, http.StatusInternalServerError, map[string]string{"error": "Failed to retrieve interactions"})
+		}
 		return
 	}
 
 	sendJSONResponse(w, http.StatusOK, results)
 }
 
-// --- Helper Functions (to be implemented) ---
-
 // writeInteraction saves an interaction record to FrostDB
 func writeInteraction(ctx context.Context, record InteractionRecord) error {
-	// Timestamp is expected to be set by the caller (handlers)
-	// if record.Timestamp == 0 {
-	// 	record.Timestamp = time.Now().UnixNano()
-	// }
 
 	_, err := table.Write(ctx, record)
 	if err != nil {
@@ -257,7 +258,7 @@ func writeInteraction(ctx context.Context, record InteractionRecord) error {
 
 // queryInteractions retrieves interactions based on filters
 func queryInteractions(ctx context.Context, filter logicalplan.Expr) ([]InteractionRecord, error) {
-	var results []InteractionRecord = make([]InteractionRecord, 0) // Initialize as an empty slice
+	var results []InteractionRecord = make([]InteractionRecord, 0)
 	var queryBuilder query.Builder
 
 	scan := queryEngine.ScanTable(tableName)
@@ -267,14 +268,20 @@ func queryInteractions(ctx context.Context, filter logicalplan.Expr) ([]Interact
 		queryBuilder = scan
 	}
 
-	err := queryBuilder.Execute(ctx, func(ctx context.Context, r arrow.Record) error {
+	projectedBuilder := queryBuilder.Project(
+		logicalplan.Col("user_id"),
+		logicalplan.Col("reported_user_id"),
+		logicalplan.Col("type"),
+		logicalplan.Col("message"),
+		logicalplan.Col("timestamp"),
+	)
+
+	err := projectedBuilder.Execute(ctx, func(ctx context.Context, r arrow.Record) error {
 		defer r.Release()
 		for i := 0; i < int(r.NumRows()); i++ {
 			record, err := arrowRecordToInteraction(r, i)
 			if err != nil {
 				log.Printf("Error converting arrow row %d to InteractionRecord: %v", i, err)
-				// Decide whether to skip the row or return an error
-				// Skipping for now
 				continue
 			}
 			results = append(results, record)
@@ -290,8 +297,6 @@ func queryInteractions(ctx context.Context, filter logicalplan.Expr) ([]Interact
 	return results, nil
 }
 
-// arrowRecordToInteraction converts an arrow record row to InteractionRecord
-// This needs careful implementation based on the exact FrostDB schema and arrow types.
 func arrowRecordToInteraction(rec arrow.Record, row int) (InteractionRecord, error) {
 	interaction := InteractionRecord{}
 	schema := rec.Schema()
@@ -303,25 +308,25 @@ func arrowRecordToInteraction(rec arrow.Record, row int) (InteractionRecord, err
 		}
 
 		switch field.Name {
-		case "userId":
+		case "user_id":
 			if dictArr, ok := col.(*array.Dictionary); ok {
 				if strArr, ok := dictArr.Dictionary().(*array.String); ok {
 					interaction.UserID = strArr.Value(dictArr.GetValueIndex(row))
 				} else {
-					return InteractionRecord{}, fmt.Errorf("unexpected dictionary type for userId: %T", dictArr.Dictionary())
+					return InteractionRecord{}, fmt.Errorf("unexpected dictionary type for user_id: %T", dictArr.Dictionary())
 				}
 			} else {
-				return InteractionRecord{}, fmt.Errorf("unexpected array type for userId: %T", col)
+				return InteractionRecord{}, fmt.Errorf("unexpected array type for user_id: %T", col)
 			}
-		case "reportedUserId":
+		case "reported_user_id":
 			if dictArr, ok := col.(*array.Dictionary); ok {
 				if strArr, ok := dictArr.Dictionary().(*array.String); ok {
 					interaction.ReportedUserID = strArr.Value(dictArr.GetValueIndex(row))
 				} else {
-					return InteractionRecord{}, fmt.Errorf("unexpected dictionary type for reportedUserId: %T", dictArr.Dictionary())
+					return InteractionRecord{}, fmt.Errorf("unexpected dictionary type for reported_user_id: %T", dictArr.Dictionary())
 				}
 			} else {
-				return InteractionRecord{}, fmt.Errorf("unexpected array type for reportedUserId: %T", col)
+				return InteractionRecord{}, fmt.Errorf("unexpected array type for reported_user_id: %T", col)
 			}
 		case "type":
 			if dictArr, ok := col.(*array.Dictionary); ok {
